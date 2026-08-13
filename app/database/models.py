@@ -379,6 +379,12 @@ class UserPrefs(Base):
     horizon: Mapped[int] = mapped_column(Integer, nullable=False, default=12)
     r_bench: Mapped[Decimal] = mapped_column(Numeric(6, 4), nullable=False, default=Decimal("0.14"))
     base_currency: Mapped[str] = mapped_column(String(3), nullable=False, default="RUB")
+    # ADR-017: статус ИИС — только тип А получает численный расчёт вычета
+    # (app/core/investment.py::estimate_iis_deduction), Б/three/none — текстовая нота.
+    iis_type: Mapped[str] = mapped_column(String(8), nullable=False, default="none")
+    iis_contributed_this_year: Mapped[Decimal] = mapped_column(
+        Numeric(12, 2), nullable=False, default=Decimal("0")
+    )
     updated_at: Mapped[datetime] = mapped_column(
         DateTime, nullable=False, default=utcnow, onupdate=utcnow
     )
@@ -510,6 +516,41 @@ class PlanSnapshot(Base):
     # полный топ-3 (JSON) — для детального просмотра истории
     top3: Mapped[Optional[list]] = mapped_column(JSON, nullable=True)
     note: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
+    is_deleted: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, index=True)
+    deleted_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+
+
+class PlanAdviceEvent(Base):
+    """Телеметрия принятия совета (волна 0, п. 0.6, `docs/model/telemetry_spec.md`).
+
+    ДОРМАНТНАЯ инфраструктура: запись в эту таблицу происходит только когда
+    `settings.TELEMETRY_COLLECTION_ENABLED=True` (default False,
+    `app/api/routes_telemetry.py::_ensure_telemetry_enabled`) — правовой контур
+    обезличивания для использования этих данных в сертификации модели (152-ФЗ,
+    ROADMAP §8.2а) закрывается юристом отдельно, флаг переключается только после.
+
+    Две фазы: `shown_at` пишется при показе плана (POST), `outcome`/
+    `modified_to`/`decided_at` — при решении пользователя (PATCH), могут не
+    заполниться никогда (пользователь ушёл, не решив).
+    """
+
+    __tablename__ = "plan_advice_events"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    plan_id: Mapped[str] = mapped_column(
+        String(36), nullable=False, index=True, default=lambda: str(uuid.uuid4())
+    )
+    user_id: Mapped[Optional[str]] = mapped_column(
+        ForeignKey("users.id"), nullable=True, index=True
+    )
+    model_version: Mapped[str] = mapped_column(String(32), nullable=False)
+    app_version: Mapped[str] = mapped_column(String(32), nullable=False)
+    input_snapshot_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    advice: Mapped[dict] = mapped_column(JSON, nullable=False)
+    outcome: Mapped[Optional[str]] = mapped_column(String(16), nullable=True)
+    modified_to: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
+    shown_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=utcnow)
+    decided_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
     is_deleted: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, index=True)
     deleted_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
 

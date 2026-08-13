@@ -30,6 +30,7 @@ from app.database.models import (
     Notification,
     Obligation,
     ObligationPayment,
+    PlanAdviceEvent,
     PlanSnapshot,
     Recommendation,
     Scenario,
@@ -950,6 +951,8 @@ def update_user_prefs(
     horizon: Optional[int] = None,
     r_bench: Optional[float] = None,
     base_currency: Optional[str] = None,
+    iis_type: Optional[str] = None,
+    iis_contributed_this_year: Optional[float] = None,
     user_id: Optional[str] = None,
 ) -> UserPrefs:
     prefs = get_user_prefs(db, user_id=user_id)
@@ -963,6 +966,10 @@ def update_user_prefs(
         prefs.r_bench = r_bench
     if base_currency is not None:
         prefs.base_currency = base_currency
+    if iis_type is not None:
+        prefs.iis_type = iis_type
+    if iis_contributed_this_year is not None:
+        prefs.iis_contributed_this_year = iis_contributed_this_year
     db.commit()
     db.refresh(prefs)
     return prefs
@@ -1610,3 +1617,57 @@ def grant_premium_days(db: Session, user_id: str, days: int) -> Optional[User]:
     db.commit()
     db.refresh(user)
     return user
+
+
+# ─────────── Телеметрия принятия совета (волна 0, п. 0.6) ──────────────────
+# ДОРМАНТНАЯ инфраструктура — вызывается только за settings.TELEMETRY_COLLECTION_ENABLED
+# (см. app/api/routes_telemetry.py). Функции сами это не проверяют: gate — забота
+# роута, не CRUD-слоя (тот же принцип разделения, что у остальных create_*).
+
+def create_advice_event(
+    db: Session,
+    user_id: str,
+    model_version: str,
+    app_version: str,
+    input_snapshot_hash: str,
+    advice: dict,
+) -> PlanAdviceEvent:
+    event = PlanAdviceEvent(
+        user_id=user_id,
+        model_version=model_version,
+        app_version=app_version,
+        input_snapshot_hash=input_snapshot_hash,
+        advice=advice,
+    )
+    db.add(event)
+    db.commit()
+    db.refresh(event)
+    return event
+
+
+def record_advice_decision(
+    db: Session,
+    plan_id: str,
+    user_id: str,
+    outcome: str,
+    modified_to: Optional[dict] = None,
+) -> Optional[PlanAdviceEvent]:
+    """None, если события с таким plan_id у ЭТОГО пользователя нет (чужой
+    plan_id или опечатка) — роут превращает это в 404, не в тихий no-op."""
+    event = (
+        db.query(PlanAdviceEvent)
+        .filter(
+            PlanAdviceEvent.plan_id == plan_id,
+            PlanAdviceEvent.user_id == user_id,
+            PlanAdviceEvent.is_deleted == False,  # noqa: E712
+        )
+        .one_or_none()
+    )
+    if event is None:
+        return None
+    event.outcome = outcome
+    event.modified_to = modified_to
+    event.decided_at = utcnow()
+    db.commit()
+    db.refresh(event)
+    return event

@@ -42,6 +42,7 @@ from app.services.forecasting import build_monthly_history, forecast_indicators
 from app.services.currency import to_base_currency
 from app.services.plan_export import plan_to_pdf, plan_to_xlsx
 from app.services.planning import run_planning
+from app.schemas.planning import PlanningCalculateResponse
 from app.utils.time import utcnow
 
 
@@ -82,6 +83,9 @@ def _plan_fingerprint(
     r_bench: float,
     risk_tolerance: int,
     l_min: float,
+    income_history: list[float] | None = None,
+    iis_type: str = "none",
+    iis_contributed_this_year: float = 0.0,
 ) -> str:
     payload = {
         "income": round(float(income_total), 2),
@@ -92,6 +96,14 @@ def _plan_fingerprint(
         "l_min": round(float(l_min), 4),
         "obligations": _stable_items(obligations),
         "goals": _stable_items(goals),
+        # ADR-015: история дохода влияет на floor через волатильность — без
+        # неё в отпечатке кэш отдавал бы старый floor после смены истории.
+        "income_history": [round(float(v), 2) for v in (income_history or [])],
+        # ADR-017: статус ИИС меняет только текст/диагностику транша, но и это
+        # часть ответа — без него кэш отдавал бы старую (или чужую) заметку
+        # про вычет после смены статуса ИИС пользователем.
+        "iis_type": iis_type,
+        "iis_contributed_this_year": round(float(iis_contributed_this_year), 2),
     }
     blob = json.dumps(payload, sort_keys=True, default=str, ensure_ascii=False)
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()
@@ -159,7 +171,11 @@ def _serialize_assets(items) -> list[dict[str, Any]]:
     ]
 
 
-@router.post("/calculate", summary="Полный цикл СППР: генерация и ранжирование альтернатив")
+@router.post(
+    "/calculate",
+    summary="Полный цикл СППР: генерация и ранжирование альтернатив",
+    response_model=PlanningCalculateResponse,
+)
 def calculate_plan(
     payload: PlanningRequest,
     db: Session = Depends(get_db),
@@ -243,6 +259,13 @@ def _compute_plan(
     # active_goals = только незакрытые цели
     active_goals = prepared["active_goals"]
 
+    # ADR-015 (канон v3.7.0): реальная помесячная история дохода — влияет
+    # только на floor резерва через волатильность (app/core/ranking.py::
+    # income_cv), income_total/Rt/Dt/кризисный режим не трогает. transactions
+    # ещё НЕ отфильтрованы по periodDays=30 (prepare_data фильтрует внутри
+    # СВОЕЙ копии) — здесь нужен полный список для истории за 8 месяцев.
+    income_history = build_monthly_history(transactions)["income"]
+
     cache_key = "plan:%s:%s" % (
         user_id or "guest",
         _plan_fingerprint(
@@ -254,6 +277,9 @@ def _compute_plan(
             r_bench=r_bench,
             risk_tolerance=risk_tolerance,
             l_min=l_min,
+            income_history=income_history,
+            iis_type=prefs.iis_type,
+            iis_contributed_this_year=float(prefs.iis_contributed_this_year),
         ),
     )
     cached = _planning_cache.get(cache_key)
@@ -270,6 +296,9 @@ def _compute_plan(
         r_bench=r_bench,
         risk_tolerance=risk_tolerance,
         l_min=l_min,
+        income_history=income_history,
+        iis_type=prefs.iis_type,
+        iis_contributed_this_year=float(prefs.iis_contributed_this_year),
     )
 
     result["input_summary"] = {

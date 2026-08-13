@@ -28,7 +28,7 @@ class Settings(BaseSettings):
         description="Название проекта.",
     )
     APP_VERSION: str = Field(
-        default="8.0.0",
+        default="8.19.2",
         description="Версия приложения (INFRA-13): код, UI-футер, git-тег.",
     )
     PROJECT_TAGLINE: str = Field(
@@ -45,9 +45,25 @@ class Settings(BaseSettings):
         default="development",
         description="Окружение: development | production (INFRA-10/12).",
     )
+    TELEMETRY_COLLECTION_ENABLED: bool = Field(
+        default=False,
+        description=(
+            "Телеметрия принятия совета (волна 0, п. 0.6, docs/model/telemetry_spec.md). "
+            "False по умолчанию — намеренно: правовой контур обезличивания для "
+            "использования этих данных в сертификации модели (152-ФЗ, ROADMAP §8.2а) "
+            "закрывается юристом отдельно от кода. Переключать в True — решение "
+            "владельца ПОСЛЕ закрытия контура, не автоматика при деплое."
+        ),
+    )
     CORS_ORIGINS: str = Field(
-        default="http://localhost:8000,http://127.0.0.1:8000",
-        description="Разрешённые источники CORS через запятую (INFRA-12).",
+        default=(
+            "http://localhost:8000,http://127.0.0.1:8000,"
+            "http://localhost:5173,http://127.0.0.1:5173"
+        ),
+        description=(
+            "Разрешённые источники CORS через запятую (INFRA-12). "
+            "5173 — Vite dev-server (frontend/), веха 8, Э2+; прод переопределяет env-переменной."
+        ),
     )
     RATE_LIMIT_REQUESTS: int = Field(
         default=30,

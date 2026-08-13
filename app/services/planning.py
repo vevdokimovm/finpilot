@@ -13,11 +13,13 @@
 """
 from __future__ import annotations
 
+from dataclasses import asdict
 from datetime import datetime
 from typing import Any
 
 from app.core.money import FLOW_EPS, money
 from app.core.alternatives import evaluate_alternative, generate_alternatives
+from app.core.amortization import build_debt_amortization_schedule
 from app.core.crisis import build_crisis_plan
 from app.core.filtering import B_MIN, DT_MAX, L_MIN, filter_alternatives
 from app.core.goals_priority import preallocate_from_bliq
@@ -34,6 +36,7 @@ from app.core.metrics import (
 from app.core.ranking import (
     RISK_PROFILES,
     effective_floor_months,
+    income_cv,
     rank_alternatives,
 )
 from app.core.recommendation import explain_alternative
@@ -52,8 +55,22 @@ def run_planning(
     today: datetime | None = None,
     step: float = 0.10,
     toxic_floor: bool = True,
+    income_history: list[float] | None = None,
+    iis_type: str = "none",
+    iis_contributed_this_year: float = 0.0,
 ) -> dict[str, Any]:
-    """Полный цикл планирования СППР по ВКР (этапы 1–6)."""
+    """Полный цикл планирования СППР по ВКР (этапы 1–6).
+
+    iis_type/iis_contributed_this_year (ADR-017, канон v3.9.0): статус ИИС
+    пользователя — влияет ТОЛЬКО на текст/диагностику инвестиционного транша
+    (`app/core/investment.py::estimate_iis_deduction`), вызывается ПОСЛЕ
+    ранжирования, никогда не входит в utility/сортировку/выбор альтернативы.
+
+    income_history (ADR-015, канон v3.7.0): реальная помесячная история дохода
+    (app/services/forecasting.py::build_monthly_history) — влияет ТОЛЬКО на floor
+    резерва через волатильность (income_cv). Rt/Dt/кризисный режим считаются по
+    income_total (факт текущего месяца) безусловно, история на них не влияет.
+    """
     today = today or utcnow()
     profile = RISK_PROFILES.get(risk_tolerance, RISK_PROFILES[3])
 
@@ -136,8 +153,11 @@ def run_planning(
     # ── Ранжирование ───────────────────────────────────────────────────
     # G8 (стенд р.4): при токсичном долге стартовый запас ликвидности
     # сокращается — лавина по ставке 40-290% дороже страховки от сбоя дохода.
-    floor_months = (effective_floor_months(obligations, r_bench)
-                    if toxic_floor else None)
+    # ADR-015: волатильность дохода поднимает floor в обратную сторону.
+    floor_months = (
+        effective_floor_months(obligations, r_bench, income_history=income_history)
+        if toxic_floor else None
+    )
     ranked = rank_alternatives(admissible, risk_tolerance,
                                floor_months=floor_months)
 
@@ -151,6 +171,8 @@ def run_planning(
             expense_total=expense_total,
             lt_target=float(profile["lt_target"]),
             risk_tolerance=risk_tolerance,
+            iis_type=iis_type,
+            iis_contributed_this_year=iis_contributed_this_year,
         )
 
     # Дедупликация по ФАКТИЧЕСКОМУ распределению: если досрочка перенаправлена
@@ -176,8 +198,15 @@ def run_planning(
         distinct_ranked.append(alt)
 
     # ── Top-3 с объяснениями ───────────────────────────────────────────
+    # next_alt (батч 0.4, Волна 0): следующая по рангу альтернатива для
+    # контрфакта — реально посчитанный сосед из того же distinct_ranked[],
+    # не гипотетический сценарий. У последней в top3 next_alt берётся из
+    # хвоста distinct_ranked (если он есть за пределами тройки).
     top3 = []
-    for alt in distinct_ranked[:3]:
+    for i, alt in enumerate(distinct_ranked[:3]):
+        next_alt = (
+            distinct_ranked[i + 1] if i + 1 < len(distinct_ranked) else None
+        )
         explanation = explain_alternative(
             alt=alt,
             rt=rt, lt=lt, dt=dt,
@@ -186,10 +215,29 @@ def run_planning(
             goals_total=goals_total,
             risk_profile_label=profile["label"],
             alternatives_count=len(alternatives),
+            next_alt=next_alt,
         )
         top3.append({**alt, "explanation": explanation})
 
     best = top3[0] if top3 else None
+
+    # ADR-016 (канон v3.8.0): график погашения ПОБЕДИВШЕЙ альтернативы. Строго
+    # ПОСЛЕ ranking/crisis — чистый read-only downstream-потребитель уже
+    # принятого решения; красная линия «не влияет на Rt/Dt/crisis_plan»
+    # выполняется по конструкции (amortization.py не импортируется
+    # ranking.py/crisis.py). Считается ОДИН раз для best, не на все
+    # альтернативы сетки d/r/g (контроль стоимости).
+    debt_schedule = None
+    if best is not None:
+        debt_schedule = build_debt_amortization_schedule(
+            # ИСХОДНЫЕ obligations, не best["obligation_allocation"] — тот уже
+            # отражает ОДНОРАЗОВОЕ применение x_obl_effective; на исходных
+            # балансах x_obl_effective разворачивается как РЕГУЛЯРНЫЙ
+            # ежемесячный платёж — в этом и смысл полного графика.
+            obligations=obligations,
+            x_obl_monthly=float(best.get("x_obl_effective", 0.0)),
+            r_bench=r_bench,
+        )
 
     return {
         "indicators": {
@@ -207,6 +255,19 @@ def run_planning(
             # Флаг перегруженного ПДН (v3.1.0): план выдаётся, но пользователю
             # показывается предупреждение + рекомендация рефинансирования.
             "Dt_alert": dt > DT_MAX,
+            # ADR-015 (канон v3.7.0): диагностика волатильности дохода — None,
+            # если истории недостаточно (income_cv сама решает, что значит
+            # «недостаточно»). Только для объяснения пользователю, почему floor
+            # выше обычного; на Rt/Dt/допустимость не влияет.
+            "income_cv": (
+                round(cv, 4) if (cv := income_cv(income_history)) is not None
+                else None
+            ),
+            # ADR-016 (канон v3.8.0): диагностика графика погашения победившей
+            # альтернативы — None, если досрочки нет/некуда её девать. Только
+            # для объяснения пользователю, не участвует в допустимости/
+            # ранжировании.
+            "debt_schedule": asdict(debt_schedule) if debt_schedule else None,
         },
         "bliq_preallocation": {
             "closed_goals": [
